@@ -1,50 +1,65 @@
 # -*- coding: utf-8 -*-
-"""
-PollenSDA -> Web-Scraping & CSV -> Gemini KI -> SDA-Meldung -> E-Mail (BILINGUAL)
-- Zieht OGD-Pollen-CSV des Bundes
-- Übersetzungsmatrix für DE/FR
-- Zwei getrennte KI-Prompts (SDA / ATS)
-- Getrennter Mailversand an DE- und FR-Redaktion
-"""
+import warnings
+warnings.filterwarnings("ignore")
+
 import os
-import json
-import smtplib
-import requests
-import html
-import re
 import csv
+import json
+import re
+import smtplib
 from datetime import datetime, timedelta
 from email.mime.multipart import MIMEMultipart
 from email.mime.text import MIMEText
 from io import StringIO
-from pymongo import MongoClient
+
 import certifi
+import requests
+import yaml
+from pymongo import MongoClient
+import vertexai
+from vertexai.generative_models import GenerativeModel
 
-from google import genai
-from google.genai import types
+# ========== 1. Konfiguration & GCP / MongoDB Setup ==========
+BASE_DIR = os.path.dirname(os.path.abspath(__file__))
 
-
-# ========== 1. Konfiguration laden ==========
 def load_config():
-    config_path = "config.json"
+    config_path = os.path.join(BASE_DIR, "env.yaml")
     if not os.path.exists(config_path):
-        print(f"Fehler: {config_path} nicht gefunden!")
-        exit(1)
+        raise FileNotFoundError(f"Konfigurationsdatei '{config_path}' nicht gefunden.")
     with open(config_path, "r", encoding="utf-8") as f:
-        return json.load(f)
-
+        return yaml.safe_load(f)
 
 CONFIG = load_config()
-GEMINI_API_KEY = CONFIG.get("GEMINI_API_KEY", "")
-GEMINI_MODEL = CONFIG.get("GEMINI_MODEL", "gemini-2.5-flash")
-EMAIL_SENDER = CONFIG.get("EMAIL_SENDER", "")
-EMAIL_PASSWORD = CONFIG.get("EMAIL_PASSWORD", "")
-EMAIL_RECEIVER_DE = CONFIG.get("EMAIL_RECEIVER_DE", "")
-EMAIL_RECEIVER_FR = CONFIG.get("EMAIL_RECEIVER_FR", "")
 
-SEEN_FILE = "seen_pollen.json"
+# Google Application Credentials setzen (zentral oder lokal)
+if "GOOGLE_APPLICATION_CREDENTIALS" not in os.environ:
+    candidate_keys = [
+        os.path.join(BASE_DIR, "vertex_key.json"),
+        os.path.join(BASE_DIR, "credentials.json"),
+        "/home/joris/Python_Programme/Wetter/credentials.json"
+    ]
+    for key_path in candidate_keys:
+        if os.path.exists(key_path):
+            os.environ["GOOGLE_APPLICATION_CREDENTIALS"] = key_path
+            break
 
-# ========== 2. Zweisprachige Matrix (Dictionaries) ==========
+# Vertex AI initialisieren
+GCP_PROJECT = CONFIG.get("GCP_PROJECT_ID", "np360-477519")
+GCP_LOCATION = CONFIG.get("GCP_LOCATION", "europe-west6")
+vertexai.init(project=GCP_PROJECT, location=GCP_LOCATION)
+AI_MODEL_NAME = CONFIG.get("GEMINI_MODEL", "gemini-2.5-flash")
+
+# MongoDB initialisieren
+MONGO_URI = CONFIG.get("MONGO_URI")
+MONGO_DB_NAME = CONFIG.get("MONGO_DB_NAME", "weather_bots")
+mongo_client = MongoClient(MONGO_URI, tlsCAFile=certifi.where()) if MONGO_URI else None
+db = mongo_client[MONGO_DB_NAME] if mongo_client else None
+collection_pollen = db["pollen_live"] if db is not None else None
+
+SEEN_FILE = os.path.join(BASE_DIR, "seen_pollen.json")
+NORM_FILE = os.path.join(BASE_DIR, "pollen_normwerte_1991_2020.json")
+
+# ========== 2. Zweisprachige Matrix & Schwellenwerte ==========
 DICT = {
     "stations": {
         "pge": {"de": "Genf / Bassin Lémanique", "fr": "Genève / Bassin Lémanique"},
@@ -61,13 +76,13 @@ DICT = {
         "pbu": {"de": "St. Gallen / Ostschweiz", "fr": "Saint-Gall / Suisse orientale"}
     },
     "pollen": {
-            "kabetud0": {"de": "Birke", "fr": "Bouleau", "url_name": "birke"},
-            "khpoacd0": {"de": "Gräser", "fr": "Graminées", "url_name": "graeser"},
-            "kafraxd0": {"de": "Esche", "fr": "Frêne", "url_name": "esche"},
-            "kacoryd0": {"de": "Hasel", "fr": "Noisetier", "url_name": "hasel"},
-            "kaalnud0": {"de": "Erle", "fr": "Aulne", "url_name": "erle"},
-            "kaquerd0": {"de": "Eiche", "fr": "Chêne", "url_name": "eiche"},  # Jetzt korrekt!
-            "kafagud0": {"de": "Buche", "fr": "Hêtre", "url_name": "buche"}    # Jetzt korrekt!
+        "kabetud0": {"de": "Birke", "fr": "Bouleau", "url_name": "birke"},
+        "khpoacd0": {"de": "Gräser", "fr": "Graminées", "url_name": "graeser"},
+        "kafraxd0": {"de": "Esche", "fr": "Frêne", "url_name": "esche"},
+        "kacoryd0": {"de": "Hasel", "fr": "Noisetier", "url_name": "hasel"},
+        "kaalnud0": {"de": "Erle", "fr": "Aulne", "url_name": "erle"},
+        "kaquerd0": {"de": "Eiche", "fr": "Chêne", "url_name": "eiche"},
+        "kafagud0": {"de": "Buche", "fr": "Hêtre", "url_name": "buche"}
     },
     "wochentage": {
         "de": ["Montag", "Dienstag", "Mittwoch", "Donnerstag", "Freitag", "Samstag", "Sonntag"],
@@ -90,29 +105,25 @@ THRESHOLDS = {
     "kafraxd0": {"schwach": "1-10", "maessig": "11-99", "stark": 100, "sehr_stark": 350},
     "kacoryd0": {"schwach": "1-10", "maessig": "11-69", "stark": 70, "sehr_stark": 250},
     "kaalnud0": {"schwach": "1-10", "maessig": "11-69", "stark": 70, "sehr_stark": 250},
-    "kaquerd0": {"schwach": "1-49", "maessig": "50-129", "stark": 130, "sehr_stark": 400},  # Jetzt korrekt!
-    "kafagud0": {"schwach": "1-49", "maessig": "50-129", "stark": 130, "sehr_stark": 400}   # Jetzt korrekt!
+    "kaquerd0": {"schwach": "1-49", "maessig": "50-129", "stark": 130, "sehr_stark": 400},
+    "kafagud0": {"schwach": "1-49", "maessig": "50-129", "stark": 130, "sehr_stark": 400}
 }
 
-
-# ========== 3. Hilfsfunktionen ==========
+# ========== 3. Hilfsfunktionen & Normwerte ==========
 def _load_json(path: str, fallback):
-    if not os.path.exists(path): return fallback
+    if not os.path.exists(path):
+        return fallback
     try:
         with open(path, "r", encoding="utf-8") as f:
             return json.load(f)
     except Exception:
         return fallback
 
-
 def _save_json(path: str, data):
     with open(path, "w", encoding="utf-8") as f:
         json.dump(data, f, ensure_ascii=False, indent=2)
 
-
-NORM_FILE = "pollen_normwerte_1991_2020.json"
 NORMWERTE = _load_json(NORM_FILE, {})
-
 
 # ========== 4. Daten-Beschaffung ==========
 def fetch_current_background_text(lang: str) -> str:
@@ -121,17 +132,14 @@ def fetch_current_background_text(lang: str) -> str:
     try:
         response = requests.get(url, headers=headers, timeout=15)
         response.raise_for_status()
-        html_content = response.text
-        paragraphs = re.findall(r'<p[^>]*>(.*?)</p>', html_content, flags=re.IGNORECASE | re.DOTALL)
-        clean_text_blocks = [re.sub(r'<[^>]+>', '', p).strip() for p in paragraphs]
-        editorial_paragraphs = [p for p in clean_text_blocks if
-                                len(p) > 80 and "Cookie" not in p and "Copyright" not in p]
-        if editorial_paragraphs:
-            return "\n\n".join(editorial_paragraphs)[:1500]
+        paragraphs = re.findall(r'<p[^>]*>(.*?)</p>', response.text, flags=re.IGNORECASE | re.DOTALL)
+        clean = [re.sub(r'<[^>]+>', '', p).strip() for p in paragraphs]
+        editorial = [p for p in clean if len(p) > 80 and "Cookie" not in p and "Copyright" not in p]
+        if editorial:
+            return "\n\n".join(editorial)[:1500]
     except Exception:
         pass
     return ""
-
 
 def fetch_latest_csv_data(station_id: str):
     headers = {"User-Agent": "Mozilla/5.0"}
@@ -144,21 +152,17 @@ def fetch_latest_csv_data(station_id: str):
             if r.status_code == 200:
                 reader = csv.DictReader(StringIO(r.text), delimiter=';')
                 rows = list(reader)
-                if not rows: continue
+                if not rows:
+                    continue
 
-                # Wir gehen von der neuesten Zeile rückwärts, bis wir eine mit Daten finden
                 valid_row = None
                 valid_prev_row = None
-
                 for i in range(len(rows) - 1, -1, -1):
-                    # Testen, ob in den wichtigsten Pollenfeldern überhaupt Werte stehen
-                    if rows[i].get('khpoacd0') and rows[i]['khpoacd0'].strip() != '':
+                    if any(rows[i].get(p, "").strip() != "" for p in THRESHOLDS.keys()):
                         valid_row = rows[i]
-                        # Die Vorperiode ist dann einfach die Zeile davor
                         valid_prev_row = rows[i - 1] if i > 0 else rows[i]
                         break
 
-                # Falls im ganzen File nur Leeres steht, nimm als Fallback die letzte Zeile
                 if not valid_row:
                     valid_row = rows[-1]
                     valid_prev_row = rows[-2] if len(rows) >= 2 else rows[0]
@@ -168,52 +172,39 @@ def fetch_latest_csv_data(station_id: str):
             continue
     return {}, {}
 
-
 def get_historical_context(station_id: str, param_id: str, threshold: float, current_val: float, lang: str) -> str:
     station_data = NORMWERTE.get(station_id, {})
     param_data = station_data.get(param_id, {})
-
     if not param_data:
-        if lang == "de":
-            return "Für diese Region/Pollenart liegen keine ausreichenden Klimanormwerte (1991-2020) vor."
-        else:
-            return "Données climatiques (1991-2020) insuffisantes pour cette région/ce pollen."
+        return "Für diese Region/Pollenart liegen keine ausreichenden Klimanormwerte (1991-2020) vor." if lang == "de" else "Données climatiques (1991-2020) insuffisantes pour cette région/ce pollen."
 
     current_year = datetime.now().year
     today_yday = datetime.now().timetuple().tm_yday
     avg_start_yday = param_data.get("avg_start_yday")
     avg_heute = param_data.get("daily_normals", {}).get(str(today_yday), 0.0)
 
-    kontext_texte = []
-
+    kontext = []
     if avg_start_yday:
         avg_date = datetime(current_year, 1, 1) + timedelta(days=avg_start_yday - 1)
         diff = today_yday - avg_start_yday
         if diff < -7:
-            kontext_texte.append(
-                f"Der Saisonstart erfolgte extrem früh (Schnitt 1991–2020: um den {avg_date.strftime('%d.%m.')})." if lang == "de" else f"Le début de saison a été très précoce (Moyenne 1991-2020: vers le {avg_date.strftime('%d.%m.')}).")
-
+            kontext.append(f"Der Saisonstart erfolgte extrem früh (Schnitt 1991–2020: um den {avg_date.strftime('%d.%m.')})." if lang == "de" else f"Le début de saison a été très précoce (Moyenne 1991-2020: vers le {avg_date.strftime('%d.%m.')}).")
 
     if avg_heute > 0:
         if current_val > (avg_heute * 1.5):
-            kontext_texte.append(
-                f"Aktuelle Belastung liegt massiv über dem langjährigen Schnitt (Klimanorm: {avg_heute:.1f} P/m³)." if lang == "de" else f"La charge actuelle est massivement supérieure à la moyenne à long terme (Norme climatique: {avg_heute:.1f} P/m³).")
+            kontext.append(f"Aktuelle Belastung liegt massiv über dem langjährigen Schnitt (Klimanorm: {avg_heute:.1f} P/m³)." if lang == "de" else f"La charge actuelle est massivement supérieure à la moyenne à long terme (Norme climatique: {avg_heute:.1f} P/m³).")
         elif current_val < (avg_heute * 0.5):
-            kontext_texte.append(
-                f"Aktuelle Belastung tiefer als langjähriger Schnitt (Klimanorm: {avg_heute:.1f} P/m³)." if lang == "de" else f"La charge actuelle est inférieure à la moyenne à long terme (Norme climatique: {avg_heute:.1f} P/m³).")
+            kontext.append(f"Aktuelle Belastung tiefer als langjähriger Schnitt (Klimanorm: {avg_heute:.1f} P/m³)." if lang == "de" else f"La charge actuelle est inférieure à la moyenne à long terme (Norme climatique: {avg_heute:.1f} P/m³).")
 
-    return " ".join(kontext_texte) if kontext_texte else (
-        "Kein Vergleich möglich." if lang == "de" else "Aucune comparaison possible.")
+    return " ".join(kontext) if kontext else ("Kein Vergleich möglich." if lang == "de" else "Aucune comparaison possible.")
 
-
-# ========== 5. KI Generierung ==========
+# ========== 5. Vertex AI Integration ==========
 def generate_sda_pollen_article(lang: str, region: str, triggering_alerts: list, other_alerts: list,
                                 current_context: str, date_str: str, messdatum_str: str, wochentag: str) -> str:
-    if not GEMINI_API_KEY: return "FEHLER: API Key fehlt."
-
     if lang == "de":
         alert_text = "=== AUSLÖSER DER MELDUNG (Massiver Anstieg / Neu) ===\n" + "\n".join(triggering_alerts)
-        if other_alerts: alert_text += "\n\n=== EBENFALLS AKTUELL STARK ===\n" + "\n".join(other_alerts)
+        if other_alerts:
+            alert_text += "\n\n=== EBENFALLS AKTUELL STARK ===\n" + "\n".join(other_alerts)
 
         system_instruction = """
         Du bist Redaktor für Keystone-SDA. Verfasse eine Agenturmeldung (150-250 Wörter).
@@ -224,80 +215,138 @@ def generate_sda_pollen_article(lang: str, region: str, triggering_alerts: list,
         """
     else:
         alert_text = "=== DÉCLENCHEURS DE L'ALERTE (Forte hausse / Nouveau) ===\n" + "\n".join(triggering_alerts)
-        if other_alerts: alert_text += "\n\n=== ÉGALEMENT FORT ACTUELLEMENT ===\n" + "\n".join(other_alerts)
+        if other_alerts:
+            alert_text += "\n\n=== ÉGALEMENT FORT ACTUELLEMENT ===\n" + "\n".join(other_alerts)
 
         system_instruction = """
-            Tu es rédacteur pour l'agence de presse Keystone-ATS. Rédige le texte d'une dépêche (150-250 mots).
-
-            RÈGLES DE STYLE STRICTES :
-            - N'écris AUCUN titre. N'écris PAS d'amorce géographique ou d'agence (ne commence PAS par "Zurich (ATS) -").
-            - Fais des phrases courtes et percutantes. Divise les phrases longues (ex: utilise un point ". Elles entraînent..." au lieu d'une virgule ", entraînant...").
-            - Utilise ". Les spécialistes parlent dans ce cas d'allergies croisées." au lieu de ", on parle alors...".
-            - Utilise des guillemets classiques ("fort") et le terme "moyenne quotidienne".
-
-            STRUCTURE IMPOSÉE :
-            1. LEAD : Commence directement par cette phrase : "La concentration de pollens de [Pollens] a atteint le niveau "[fort/très fort]" dans la région [Région], selon les données de MétéoSuisse publiées [Jour de la semaine]. Avec une moyenne quotidienne de [X] pollens par mètre cube, elle a massivement augmenté par rapport à la veille ([Y])." (S'il y a d'autres pollens, ajoute : "Les pollens de [Autres pollens] se maintiennent à un niveau élevé, tandis que ceux de [Autres] sont en hausse.")
-            2. ÉCHELLE & HISTORIQUE : Explique l'échelle : "Le niveau "[fort]" signifie que..." Sépare l'historique en phrases courtes : "Le début de saison pour le [Pollen] a été plutôt tardif/précoce cette année. La moyenne sur la période 1991-2020 se situe autour du [Date]."
-            3. CONTEXTE : Résume les informations de "aha! Centre d'Allergie" de manière très factuelle, toujours avec des phrases courtes.
-            """
+        Tu es rédacteur pour l'agence de presse Keystone-ATS. Rédige le texte d'une dépêche (150-250 mots).
+        RÈGLES DE STYLE STRICTES :
+        - N'écris AUCUN titre. N'écris PAS d'amorce géographique ou d'agence.
+        - Fais des phrases courtes et percutantes. Divise les phrases longues.
+        - Utilise des guillemets classiques ("fort") et le terme "moyenne quotidienne".
+        STRUCTURE IMPOSÉE :
+        1. LEAD : "La concentration de pollens de [Pollens] a atteint le niveau "[fort/très fort]" dans la région [Région], selon les données de MétéoSuisse publiées [Jour de la semaine]. Avec une moyenne quotidienne de [X] pollens par mètre cube, elle a massivement augmenté par rapport à la veille ([Y])."
+        2. ÉCHELLE & HISTORIQUE : Explique l'échelle et résume l'historique en phrases courtes.
+        3. CONTEXTE : Résume les informations de "aha! Centre d'Allergie" de manière factuelle.
+        """
 
     prompt = f"Publikationsdatum/Date: {date_str}\nMessdatum: {messdatum_str}\nWochentag/Jour: {wochentag}\nRegion: {region}\n\nDATEN/DONNÉES:\n{alert_text}\n\nHINTERGRUND/CONTEXTE:\n{current_context}"
 
     try:
-        client = genai.Client(api_key=GEMINI_API_KEY)
-        config = types.GenerateContentConfig(system_instruction=system_instruction, temperature=0.2)
-        response = client.models.generate_content(model=GEMINI_MODEL, contents=prompt, config=config)
+        model = GenerativeModel(AI_MODEL_NAME, system_instruction=[system_instruction])
+        response = model.generate_content(prompt)
         return response.text.strip()
     except Exception as e:
-        return f"KI-Error: {e}"
-
+        return f"Vertex-AI-Fehler: {e}"
 
 # ========== 6. E-Mail Versand ==========
-def send_email(subject: str, body: str, receiver: str):
-    print(f" -> Versuche Mail zu senden an {receiver} via {EMAIL_SENDER}...")
+def send_email(subject: str, body: str, to_key: str):
+    from_addr = CONFIG.get("MAIL_FROM_DE") or CONFIG.get("SMTP_USER")
+    to_addr = CONFIG.get(to_key)
 
-    if not all([EMAIL_SENDER, EMAIL_PASSWORD, receiver]):
-        print(" -> ❌ Mail abgebrochen: Zugangsdaten in config.json fehlen!")
+    if not from_addr or not to_addr:
+        print(f"⚠️ Mail übersprungen: Absender oder Empfänger ({to_key}) nicht konfiguriert.")
         return
 
+    if isinstance(to_addr, list):
+        recipients = to_addr
+        to_header = ", ".join(to_addr)
+    else:
+        recipients = [addr.strip() for addr in str(to_addr).split(",") if addr.strip()]
+        to_header = str(to_addr)
+
     msg = MIMEMultipart()
-    msg["From"] = EMAIL_SENDER
-    msg["To"] = receiver
+    msg["From"] = from_addr
+    msg["To"] = to_header
     msg["Subject"] = subject
-    msg.attach(MIMEText(body, "plain", _charset="utf-8"))
+    msg.attach(MIMEText(body, "plain", "utf-8"))
 
     try:
-        with smtplib.SMTP("smtp.gmail.com", 587) as server:
+        server = smtplib.SMTP(CONFIG["SMTP_SERVER"], int(CONFIG.get("SMTP_PORT", 587)))
+        if CONFIG.get("SMTP_STARTTLS", True):
             server.starttls()
-            server.login(EMAIL_SENDER, EMAIL_PASSWORD)
-            server.send_message(msg)
-            print(f" -> ✅ Mail erfolgreich gesendet an {receiver}")
+        server.login(CONFIG["SMTP_USER"], CONFIG["SMTP_PASSWORD"])
+        server.sendmail(from_addr, recipients, msg.as_string())
+        server.quit()
+        print(f"🚨 Mail erfolgreich gesendet an {recipients}: {subject}")
     except Exception as e:
-        print(f" -> ❌ Fehler Mailversand: {e}")
+        print(f"❌ Mail-Fehler bei {to_key}: {e}")
 
+# ========== 7. MongoDB Synchronisation ==========
+def sync_mongodb_station(station_id: str, row_data: dict, messdatum_str: str):
+    if collection_pollen is None:
+        return
 
-# ========== 7. Hauptlauf ==========
+    pollen_values = {}
+    highest_level = "schwach"
+
+    for param, rules in THRESHOLDS.items():
+        val_str = row_data.get(param, "")
+        try:
+            val_float = float(val_str) if val_str else 0.0
+        except ValueError:
+            val_float = 0.0
+
+        p_info = DICT["pollen"].get(param, {})
+        level = "schwach"
+        if val_float >= rules["sehr_stark"]:
+            level = "sehr stark"
+            highest_level = "sehr stark"
+        elif val_float >= rules["stark"]:
+            level = "stark"
+            if highest_level != "sehr stark":
+                highest_level = "stark"
+        elif val_float >= 10:
+            level = "maessig"
+
+        pollen_values[param] = {
+            "name_de": p_info.get("de"),
+            "name_fr": p_info.get("fr"),
+            "value": val_float,
+            "level": level
+        }
+
+    doc = {
+        "station_id": station_id,
+        "name_de": DICT["stations"][station_id]["de"],
+        "name_fr": DICT["stations"][station_id]["fr"],
+        "messdatum": messdatum_str,
+        "highest_level": highest_level,
+        "values": pollen_values,
+        "last_updated": datetime.utcnow()
+    }
+
+    collection_pollen.update_one(
+        {"station_id": station_id},
+        {"$set": doc},
+        upsert=True
+    )
+
+# ========== 8. Hauptlauf ==========
 def process_pollen():
     seen = _load_json(SEEN_FILE, {})
     today_str = datetime.now().strftime("%d.%m.%Y")
     seen_date_str = datetime.now().strftime("%Y-%m-%d")
     weekday_idx = datetime.now().weekday()
 
-    # Lade Hintergründe vorab
-    bg_texts = {"de": fetch_current_background_text("de"), "fr": fetch_current_background_text("fr")}
+    bg_texts = {
+        "de": fetch_current_background_text("de"),
+        "fr": fetch_current_background_text("fr")
+    }
 
-    for station_id in DICT["stations"].keys():
-        if seen.get(f"{station_id}_run_date") == seen_date_str: continue
+    print(f"🔄 Starte Abfrage der Pollendaten für alle Stationen ({today_str})...")
+    updated_stations = 0
 
-        print(f"Prüfe Station {station_id.upper()}...")
+    for station_id, s_info in DICT["stations"].items():
+        st_name = s_info["de"]
+        print(f"📡 Station {station_id.upper()} ({st_name}):")
+
         csv_today, csv_last = fetch_latest_csv_data(station_id)
         if not csv_today:
-            print(
-                f" -> ❌ Download fehlgeschlagen! Der Bund liefert unter diesem Link keine Daten für {station_id.upper()}.")
+            print("   ⚠️ Keine CSV-Daten verfügbar (MeteoSchweiz liefert für diese Station aktuell keine Daten).")
             continue
 
         messdatum_str = today_str
-        print("Gefundene Spalten:", list(csv_today.keys()))
         for key, val in csv_today.items():
             if key and any(k in key.lower() for k in ["date", "datum", "time"]):
                 try:
@@ -306,21 +355,27 @@ def process_pollen():
                     pass
                 break
 
-        # Daten für BEIDE Sprachen sammeln
+        # 1. MongoDB LIVE-HUB IMMER AKTUALISIEREN
+        sync_mongodb_station(station_id, csv_today, messdatum_str)
+        updated_stations += 1
+        print(f"   💾 In MongoDB ('pollen_live') aktualisiert (Messdatum: {messdatum_str}).")
+
+        # 2. ALARM-PRÜFUNG (Wird nur 1x täglich pro Station ausgelöst)
+        if seen.get(f"{station_id}_run_date") == seen_date_str:
+            print("   ℹ️ Alarm-Check für heute bereits abgeschlossen.")
+            continue
+
         alerts = {"de": {"trigger": [], "other": [], "links": [], "desk": []},
                   "fr": {"trigger": [], "other": [], "links": [], "desk": []}}
-
         has_trigger = False
 
         for param, rules in THRESHOLDS.items():
             val_str = csv_today.get(param, "")
-
-            print(f"   -> Wert für {param}: '{val_str}'")
-            if not val_str: continue
+            if not val_str:
+                continue
             try:
                 val_float = float(val_str)
                 if val_float >= rules["stark"]:
-
                     p_info = DICT["pollen"][param]
                     prev_float = float(csv_last.get(param, "0"))
 
@@ -331,52 +386,46 @@ def process_pollen():
                     else:
                         trend_key = "gleichbleibend"
 
-                    # Logik: Ist es ein Trigger?
                     last_val = seen.get(f"{station_id}_{param}", {}).get("value", 0.0)
-                    is_trigger = True if (trend_key == "gestiegen" and (
-                                last_val == 0.0 or val_float >= last_val * 1.5)) else False
-                    if is_trigger: has_trigger = True
+                    is_trigger = (trend_key == "gestiegen" and (last_val == 0.0 or val_float >= last_val * 1.5))
+                    if is_trigger:
+                        has_trigger = True
 
-                    # Text für DE und FR aufbauen
                     for lang in ["de", "fr"]:
                         name = p_info[lang]
                         trend_txt = DICT["trends"][trend_key][lang]
                         hist_txt = get_historical_context(station_id, param, rules["stark"], val_float, lang)
 
-                        if val_float >= rules["stark"]:
-                            skala = "Die höchste Stufe 'sehr stark' bedeutet für Allergiker extremes Risiko für Asthma-Anfälle." if lang == "de" else "Le niveau 'très fort' signifie un risque extrême de crise d'asthme pour les allergiques."
+                        if val_float >= rules["sehr_stark"]:
+                            skala = "Die höchste Stufe 'sehr stark' bedeutet extremes Risiko für Allergiker." if lang == "de" else "Le niveau 'très fort' signifie un risque extrême pour les personnes allergiques."
                         else:
-                            skala = "Die Stufe 'stark' bedeutet, dass die meisten Allergiker deutliche Symptome zeigen." if lang == "de" else "Le niveau 'fort' signifie que la plupart des personnes allergiques présentent des symptômes clairs."
+                            skala = "Die Stufe 'stark' bedeutet deutliche Symptome bei den meisten Betroffenen." if lang == "de" else "Le niveau 'fort' signifie des symptômes marqués chez la plupart des personnes allergiques."
 
-                        info_txt = f"{name} ({val_float} P/m³, Vortag/Veille: {prev_float}, Trend: {trend_txt}. Historie: {hist_txt} Skala: {skala})"
+                        info_txt = f"{name} ({val_float} P/m³, Vortag: {prev_float}, Trend: {trend_txt}. Historie: {hist_txt} Skala: {skala})"
 
                         if is_trigger:
                             alerts[lang]["trigger"].append(info_txt)
                         else:
                             alerts[lang]["other"].append(info_txt)
 
-                        # Desk Notes (Links)
-                        st_name = DICT["stations"][station_id][lang]
+                        st_lang_name = DICT["stations"][station_id][lang]
                         if lang == "de":
                             url = f"https://www.meteoschweiz.admin.ch/service-und-publikationen/applikationen/messwerte.html#param=messwerte-pollen-{p_info['url_name']}-1h&station={station_id.upper()}&table=false"
-                            link_txt = f"- Verifikation {name} in {st_name}: {url}"
-                            desk_txt = f'- {name}: "schwach" ({rules["schwach"]}), "mässig" ({rules["maessig"]}), "stark" ({rules["stark"]}-{rules["sehr_stark"] - 1}), "sehr stark" (ab {rules["sehr_stark"]}).'
+                            alerts["de"]["links"].append(f"- Verifikation {name} in {st_lang_name}: {url}")
+                            alerts["de"]["desk"].append(f'- {name}: "schwach" ({rules["schwach"]}), "mässig" ({rules["maessig"]}), "stark" ({rules["stark"]}-{rules["sehr_stark"] - 1}), "sehr stark" (ab {rules["sehr_stark"]}).')
                         else:
                             url = f"https://www.meteosuisse.admin.ch/services-et-publications/applications/valeurs-mesurees.html#param=messwerte-pollen-{p_info['url_name']}-1h&station={station_id.upper()}&table=false"
-                            link_txt = f"- Vérification {name} à {st_name}: {url}"
-                            desk_txt = f'- {name}: "faible" ({rules["schwach"]}), "modéré" ({rules["maessig"]}), "fort" ({rules["stark"]}-{rules["sehr_stark"] - 1}), "très fort" (dès {rules["sehr_stark"]}).'
-
-                        if link_txt not in alerts[lang]["links"]: alerts[lang]["links"].append(link_txt)
-                        if desk_txt not in alerts[lang]["desk"]: alerts[lang]["desk"].append(desk_txt)
+                            alerts["fr"]["links"].append(f"- Vérification {name} à {st_lang_name}: {url}")
+                            alerts["fr"]["desk"].append(f'- {name}: "faible" ({rules["schwach"]}), "modéré" ({rules["maessig"]}), "fort" ({rules["stark"]}-{rules["sehr_stark"] - 1}), "très fort" (dès {rules["sehr_stark"]}).')
 
             except ValueError:
                 pass
 
-        # Mail-Versand für beide Sprachen, falls Trigger vorhanden
         if has_trigger:
-            print(f"ALARM in {station_id.upper()}! Generiere Mails...")
-            for lang, receiver in [("de", EMAIL_RECEIVER_DE), ("fr", EMAIL_RECEIVER_FR)]:
-                if not alerts[lang]["trigger"]: continue  # Sicherheitshalber
+            print(f"🚨 Auslöser erkannt für Station {station_id.upper()}! Generiere Textmeldungen...")
+            for lang, to_key in [("de", "MAIL_TO_DE"), ("fr", "MAIL_TO_FR")]:
+                if not alerts[lang]["trigger"]:
+                    continue
 
                 reg_name = DICT["stations"][station_id][lang]
                 wochentag = DICT["wochentage"][lang][weekday_idx]
@@ -386,47 +435,38 @@ def process_pollen():
                     bg_texts[lang], today_str, messdatum_str, wochentag
                 )
 
-                subj = article.split("\n")[0] if article else f"Pollen: {reg_name}"
+                subj = article.split("\n")[0] if article and lang == "de" else f"Pollen: {reg_name}"
+                if lang == "fr":
+                    subj = f"Alerte Pollens: {reg_name} ({today_str})"
 
                 if lang == "de":
-                    notes = "\n\n---\nQUELLEN ZUR VERIFIKATION:\n" + "\n".join(alerts["de"][
-                                                                                   "links"]) + f"\n\nHintergrund: {DICT['aha_urls']['de']}\n\nSchwellenwerte:\n" + "\n".join(
-                        alerts["de"]["desk"])
+                    notes = "\n\n---\nQUELLEN ZUR VERIFIKATION:\n" + "\n".join(alerts["de"]["links"]) + f"\n\nHintergrund: {DICT['aha_urls']['de']}\n\nSchwellenwerte:\n" + "\n".join(alerts["de"]["desk"])
                     body = f"{article}\n\n---\nTrigger:\n" + "\n".join(alerts["de"]["trigger"]) + notes
                 else:
-                    notes = "\n\n---\nSOURCES POUR VÉRIFICATION:\n" + "\n".join(alerts["fr"][
-                                                                                    "links"]) + f"\n\nContexte: {DICT['aha_urls']['fr']}\n\nSeuils:\n" + "\n".join(
-                        alerts["fr"]["desk"])
+                    notes = "\n\n---\nSOURCES POUR VÉRIFICATION:\n" + "\n".join(alerts["fr"]["links"]) + f"\n\nContexte: {DICT['aha_urls']['fr']}\n\nSeuils:\n" + "\n".join(alerts["fr"]["desk"])
                     body = f"{article}\n\n---\nDéclencheurs:\n" + "\n".join(alerts["fr"]["trigger"]) + notes
 
-                # WICHTIG: Raute entfernen!
-                #send_email(subj, body, receiver)
-                print(f"--- [{lang.upper()}] --- \n{body}\n")
+                send_email(subj, body, to_key)
 
-            # 1. Bei einem Alarm merken wir uns den neuen hohen Wert
             for p, r in THRESHOLDS.items():
                 v = csv_today.get(p, "")
                 if v and float(v) >= r["stark"]:
                     seen[f"{station_id}_{p}"] = {"date": today_str, "value": float(v)}
 
-        elif any(alerts["de"]["other"]):
-            print(f"Info für {station_id}: Stark, aber kein Anstieg.")
-
-        # 2. NEU: Reset-Logik! Wenn ein Pollenwert wieder sinkt (Regen, Saisonende, Winter), löschen wir das Gedächtnis
         for p, r in THRESHOLDS.items():
             v = csv_today.get(p, "")
             if v:
                 try:
-                    if float(v) < r["stark"]:
-                        if f"{station_id}_{p}" in seen:
-                            seen[f"{station_id}_{p}"] = {"date": today_str, "value": 0.0}
+                    if float(v) < r["stark"] and f"{station_id}_{p}" in seen:
+                        seen[f"{station_id}_{p}"] = {"date": today_str, "value": 0.0}
                 except ValueError:
                     pass
 
-        # 3. IMMER das Datum des heutigen Checks speichern (egal ob Alarm, stark oder schwach)
         seen[f"{station_id}_run_date"] = seen_date_str
         _save_json(SEEN_FILE, seen)
 
+    print(f"💾 Gesamt: {updated_stations} Stationen in MongoDB ('pollen_live') aktualisiert.")
+    print("🏁 Pollen-Durchlauf vollständig abgeschlossen.")
 
 if __name__ == "__main__":
     process_pollen()
