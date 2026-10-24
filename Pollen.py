@@ -240,12 +240,11 @@ def generate_sda_pollen_article(lang: str, region: str, triggering_alerts: list,
         return f"Vertex-AI-Fehler: {e}"
 
 # ========== 6. E-Mail Versand ==========
-def send_email(subject: str, body: str, to_key: str):
-    from_addr = CONFIG.get("MAIL_FROM_DE") or CONFIG.get("SMTP_USER")
+def send_email(subject, body, from_key='MAIL_FROM_DE', to_key='MAIL_TO_DE'):
+    from_addr = CONFIG.get(from_key) or CONFIG.get("SMTP_USER")
     to_addr = CONFIG.get(to_key)
-
     if not from_addr or not to_addr:
-        print(f"⚠️ Mail übersprungen: Absender oder Empfänger ({to_key}) nicht konfiguriert.")
+        print(f"⚠️ Mail übersprungen: Absender ({from_key}) oder Empfänger ({to_key}) nicht konfiguriert.")
         return
 
     if isinstance(to_addr, list):
@@ -255,11 +254,10 @@ def send_email(subject: str, body: str, to_key: str):
         recipients = [addr.strip() for addr in str(to_addr).split(",") if addr.strip()]
         to_header = str(to_addr)
 
-    msg = MIMEMultipart()
+    msg = MIMEText(body, "plain", "utf-8")
     msg["From"] = from_addr
     msg["To"] = to_header
     msg["Subject"] = subject
-    msg.attach(MIMEText(body, "plain", "utf-8"))
 
     try:
         server = smtplib.SMTP(CONFIG["SMTP_SERVER"], int(CONFIG.get("SMTP_PORT", 587)))
@@ -296,8 +294,10 @@ def sync_mongodb_station(station_id: str, row_data: dict, messdatum_str: str):
             level = "stark"
             if highest_level != "sehr stark":
                 highest_level = "stark"
-        elif val_float >= 10:
+        elif val_float >= int(rules["maessig"].split("-")[0]):
             level = "maessig"
+            if highest_level == "schwach":
+                highest_level = "maessig"
 
         pollen_values[param] = {
             "name_de": p_info.get("de"),
@@ -377,7 +377,11 @@ def process_pollen():
                 val_float = float(val_str)
                 if val_float >= rules["stark"]:
                     p_info = DICT["pollen"][param]
-                    prev_float = float(csv_last.get(param, "0"))
+                    raw_prev = csv_last.get(param, "0")
+                    try:
+                        prev_float = float(raw_prev) if str(raw_prev).strip() != "" else 0.0
+                    except ValueError:
+                        prev_float = 0.0
 
                     if val_float > prev_float * 1.1:
                         trend_key = "gestiegen"
@@ -423,7 +427,8 @@ def process_pollen():
 
         if has_trigger:
             print(f"🚨 Auslöser erkannt für Station {station_id.upper()}! Generiere Textmeldungen...")
-            for lang, to_key in [("de", "MAIL_TO_DE"), ("fr", "MAIL_TO_FR")]:
+            for lang, to_key, from_key in [("de", "MAIL_TO_DE", "MAIL_FROM_DE"),
+                                           ("fr", "MAIL_TO_FR", "MAIL_FROM_FR")]:
                 if not alerts[lang]["trigger"]:
                     continue
 
@@ -440,13 +445,17 @@ def process_pollen():
                     subj = f"Alerte Pollens: {reg_name} ({today_str})"
 
                 if lang == "de":
-                    notes = "\n\n---\nQUELLEN ZUR VERIFIKATION:\n" + "\n".join(alerts["de"]["links"]) + f"\n\nHintergrund: {DICT['aha_urls']['de']}\n\nSchwellenwerte:\n" + "\n".join(alerts["de"]["desk"])
+                    notes = "\n\n---\nQUELLEN ZUR VERIFIKATION:\n" + "\n".join(alerts["de"][
+                                                                                   "links"]) + f"\n\nHintergrund: {DICT['aha_urls']['de']}\n\nSchwellenwerte:\n" + "\n".join(
+                        alerts["de"]["desk"])
                     body = f"{article}\n\n---\nTrigger:\n" + "\n".join(alerts["de"]["trigger"]) + notes
                 else:
-                    notes = "\n\n---\nSOURCES POUR VÉRIFICATION:\n" + "\n".join(alerts["fr"]["links"]) + f"\n\nContexte: {DICT['aha_urls']['fr']}\n\nSeuils:\n" + "\n".join(alerts["fr"]["desk"])
+                    notes = "\n\n---\nSOURCES POUR VÉRIFICATION:\n" + "\n".join(
+                        alerts["fr"]["links"]) + f"\n\nContexte: {DICT['aha_urls']['fr']}\n\nSeuils:\n" + "\n".join(
+                        alerts["fr"]["desk"])
                     body = f"{article}\n\n---\nDéclencheurs:\n" + "\n".join(alerts["fr"]["trigger"]) + notes
 
-                send_email(subj, body, to_key)
+                send_email(subj, body, from_key=from_key, to_key=to_key)
 
             for p, r in THRESHOLDS.items():
                 v = csv_today.get(p, "")
