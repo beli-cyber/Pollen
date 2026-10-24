@@ -334,15 +334,16 @@ def process_pollen():
         "fr": fetch_current_background_text("fr")
     }
 
-    print("🔄 Starte Abfrage der Pollendaten für alle Stationen...")
+    print(f"🔄 Starte Abfrage der Pollendaten für alle Stationen ({today_str})...")
     updated_stations = 0
 
-    for station_id in DICT["stations"].keys():
-        if seen.get(f"{station_id}_run_date") == seen_date_str:
-            continue
+    for station_id, s_info in DICT["stations"].items():
+        st_name = s_info["de"]
+        print(f"📡 Station {station_id.upper()} ({st_name}):")
 
         csv_today, csv_last = fetch_latest_csv_data(station_id)
         if not csv_today:
+            print("   ⚠️ Keine CSV-Daten verfügbar (MeteoSchweiz liefert für diese Station aktuell keine Daten).")
             continue
 
         messdatum_str = today_str
@@ -354,9 +355,15 @@ def process_pollen():
                     pass
                 break
 
-        # MongoDB Live-Dokument aktualisieren
+        # 1. MongoDB LIVE-HUB IMMER AKTUALISIEREN
         sync_mongodb_station(station_id, csv_today, messdatum_str)
         updated_stations += 1
+        print(f"   💾 In MongoDB ('pollen_live') aktualisiert (Messdatum: {messdatum_str}).")
+
+        # 2. ALARM-PRÜFUNG (Wird nur 1x täglich pro Station ausgelöst)
+        if seen.get(f"{station_id}_run_date") == seen_date_str:
+            print("   ℹ️ Alarm-Check für heute bereits abgeschlossen.")
+            continue
 
         alerts = {"de": {"trigger": [], "other": [], "links": [], "desk": []},
                   "fr": {"trigger": [], "other": [], "links": [], "desk": []}}
@@ -401,14 +408,14 @@ def process_pollen():
                         else:
                             alerts[lang]["other"].append(info_txt)
 
-                        st_name = DICT["stations"][station_id][lang]
+                        st_lang_name = DICT["stations"][station_id][lang]
                         if lang == "de":
                             url = f"https://www.meteoschweiz.admin.ch/service-und-publikationen/applikationen/messwerte.html#param=messwerte-pollen-{p_info['url_name']}-1h&station={station_id.upper()}&table=false"
-                            alerts["de"]["links"].append(f"- Verifikation {name} in {st_name}: {url}")
+                            alerts["de"]["links"].append(f"- Verifikation {name} in {st_lang_name}: {url}")
                             alerts["de"]["desk"].append(f'- {name}: "schwach" ({rules["schwach"]}), "mässig" ({rules["maessig"]}), "stark" ({rules["stark"]}-{rules["sehr_stark"] - 1}), "sehr stark" (ab {rules["sehr_stark"]}).')
                         else:
                             url = f"https://www.meteosuisse.admin.ch/services-et-publications/applications/valeurs-mesurees.html#param=messwerte-pollen-{p_info['url_name']}-1h&station={station_id.upper()}&table=false"
-                            alerts["fr"]["links"].append(f"- Vérification {name} à {st_name}: {url}")
+                            alerts["fr"]["links"].append(f"- Vérification {name} à {st_lang_name}: {url}")
                             alerts["fr"]["desk"].append(f'- {name}: "faible" ({rules["schwach"]}), "modéré" ({rules["maessig"]}), "fort" ({rules["stark"]}-{rules["sehr_stark"] - 1}), "très fort" (dès {rules["sehr_stark"]}).')
 
             except ValueError:
@@ -458,7 +465,7 @@ def process_pollen():
         seen[f"{station_id}_run_date"] = seen_date_str
         _save_json(SEEN_FILE, seen)
 
-    print(f"💾 {updated_stations} Stationen in MongoDB ('pollen_live') aktualisiert.")
+    print(f"💾 Gesamt: {updated_stations} Stationen in MongoDB ('pollen_live') aktualisiert.")
     print("🏁 Pollen-Durchlauf vollständig abgeschlossen.")
 
 if __name__ == "__main__":
