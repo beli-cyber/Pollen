@@ -1,0 +1,30 @@
+# Sensible Zugangsdaten & Konfigurationen (NIEMALS pushen!)
+env.yaml
+Google.env
+config.json
+credentials.json
+*.yaml
+
+# Virtuelle Umgebungen & Python-Müll
+.venv/
+venv/
+__pycache__/
+*.pyc
+
+# Lokale Speicher- & Log-Dateien
+seen_ids.txt
+last_api_hash_*.txt
+*.log
+data/
+newsml_out/
+
+# PyCharm-Einstellungen
+.idea/
+
+# Generierte Bot-Dateien
+*.xml
+
+vertex_key.json
+seen_pollen.json
+*.log
+EOF

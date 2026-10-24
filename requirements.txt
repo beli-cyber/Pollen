@@ -1,0 +1,6 @@
+requests
+PyPDF2
+google-genai
+pymongo
+certifi
+```[cite: 4]
