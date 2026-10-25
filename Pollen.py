@@ -3,11 +3,13 @@ import warnings
 warnings.filterwarnings("ignore")
 
 import os
+import argparse
 import csv
+import math
 import json
 import re
 import smtplib
-from datetime import datetime, timedelta
+from datetime import datetime, timedelta, timezone
 from email.mime.multipart import MIMEMultipart
 from email.mime.text import MIMEText
 from io import StringIO
@@ -55,6 +57,7 @@ MONGO_DB_NAME = CONFIG.get("MONGO_DB_NAME", "weather_bots")
 mongo_client = MongoClient(MONGO_URI, tlsCAFile=certifi.where()) if MONGO_URI else None
 db = mongo_client[MONGO_DB_NAME] if mongo_client else None
 collection_pollen = db["pollen_live"] if db is not None else None
+collection_pollen_verlauf = db["pollen_verlauf"] if db is not None else None
 
 SEEN_FILE = os.path.join(BASE_DIR, "seen_pollen.json")
 NORM_FILE = os.path.join(BASE_DIR, "pollen_normwerte_1991_2020.json")
@@ -141,34 +144,74 @@ def fetch_current_background_text(lang: str) -> str:
         pass
     return ""
 
+def parse_messzeit(row: dict):
+    """Offizieller reference_timestamp ist UTC, meist dd.mm.yyyy HH:MM.
+
+    Kein Rückfall aufs Abrufdatum: Ohne prüfbaren Zeitstempel kein Datensatz.
+    """
+    raw = (row.get("reference_timestamp") or row.get("ReferenceTS") or "").strip()
+    for fmt in ("%d.%m.%Y %H:%M", "%d.%m.%Y %H:%M:%S",
+                "%Y-%m-%d %H:%M:%S", "%Y-%m-%d %H:%M", "%Y-%m-%d"):
+        try:
+            return datetime.strptime(raw, fmt).replace(tzinfo=timezone.utc)
+        except ValueError:
+            pass
+    return None
+
+
+def parse_pollenwert(raw):
+    """0 ist ein Messwert; Leerfeld, Fehlcode und negative Werte sind KEINE 0."""
+    if raw is None or str(raw).strip() == "":
+        return None
+    try:
+        wert = float(str(raw).strip().replace(",", "."))
+    except (TypeError, ValueError):
+        return None
+    return wert if math.isfinite(wert) and wert >= 0 else None
+
+
+def hat_messwerte(row: dict) -> bool:
+    return any(parse_pollenwert(row.get(p)) is not None for p in THRESHOLDS)
+
+
+def select_latest_rows(rows: list):
+    """Letzter gültiger Messtag und der letzte VORTAG mit Messdaten.
+
+    Liefert ({}, {}) statt ein unbekanntes Datum oder leere Werte zu erfinden.
+    """
+    heute_utc = datetime.now(timezone.utc)
+    valid = []
+    for row in rows:
+        stamp = parse_messzeit(row)
+        if stamp is not None and stamp <= heute_utc + timedelta(days=1) and hat_messwerte(row):
+            valid.append((stamp, row))
+    if not valid:
+        return {}, {}
+    valid.sort(key=lambda item: item[0])
+    aktuell_zeit, aktuell = valid[-1]
+    vorher = next((row for ts, row in reversed(valid[:-1])
+                   if ts.date() < aktuell_zeit.date()), {})
+    return aktuell, vorher
+
+
 def fetch_latest_csv_data(station_id: str):
     headers = {"User-Agent": "Mozilla/5.0"}
     url_sub = f"https://data.geo.admin.ch/ch.meteoschweiz.ogd-pollen/{station_id}/ogd-pollen_{station_id}_d_recent.csv"
     url_root = f"https://data.geo.admin.ch/ch.meteoschweiz.ogd-pollen/ogd-pollen_{station_id}_d_recent.csv"
 
-    for url in [url_sub, url_root]:
+    for url in (url_sub, url_root):
         try:
-            r = requests.get(url, headers=headers, timeout=10)
-            if r.status_code == 200:
-                reader = csv.DictReader(StringIO(r.text), delimiter=';')
-                rows = list(reader)
-                if not rows:
-                    continue
-
-                valid_row = None
-                valid_prev_row = None
-                for i in range(len(rows) - 1, -1, -1):
-                    if any(rows[i].get(p, "").strip() != "" for p in THRESHOLDS.keys()):
-                        valid_row = rows[i]
-                        valid_prev_row = rows[i - 1] if i > 0 else rows[i]
-                        break
-
-                if not valid_row:
-                    valid_row = rows[-1]
-                    valid_prev_row = rows[-2] if len(rows) >= 2 else rows[0]
-
-                return valid_row, valid_prev_row
-        except Exception:
+            r = requests.get(url, headers=headers, timeout=15)
+            r.raise_for_status()
+            reader = csv.DictReader(StringIO(r.content.decode("utf-8-sig", errors="replace")), delimiter=";")
+            if not reader.fieldnames or "reference_timestamp" not in reader.fieldnames:
+                continue
+            if not any(p in reader.fieldnames for p in THRESHOLDS):
+                continue
+            aktuell, vorher = select_latest_rows(list(reader))
+            if aktuell:
+                return aktuell, vorher
+        except (requests.RequestException, UnicodeError, csv.Error):
             continue
     return {}, {}
 
@@ -240,11 +283,12 @@ def generate_sda_pollen_article(lang: str, region: str, triggering_alerts: list,
         return f"Vertex-AI-Fehler: {e}"
 
 # ========== 6. E-Mail Versand ==========
-def send_email(subject, body, from_key='MAIL_FROM_DE', to_key='MAIL_TO_DE'):
-    from_addr = CONFIG.get(from_key) or CONFIG.get("SMTP_USER")
+def send_email(subject: str, body: str, to_key: str):
+    from_addr = CONFIG.get("MAIL_FROM_DE") or CONFIG.get("SMTP_USER")
     to_addr = CONFIG.get(to_key)
+
     if not from_addr or not to_addr:
-        print(f"⚠️ Mail übersprungen: Absender ({from_key}) oder Empfänger ({to_key}) nicht konfiguriert.")
+        print(f"⚠️ Mail übersprungen: Absender oder Empfänger ({to_key}) nicht konfiguriert.")
         return
 
     if isinstance(to_addr, list):
@@ -254,10 +298,11 @@ def send_email(subject, body, from_key='MAIL_FROM_DE', to_key='MAIL_TO_DE'):
         recipients = [addr.strip() for addr in str(to_addr).split(",") if addr.strip()]
         to_header = str(to_addr)
 
-    msg = MIMEText(body, "plain", "utf-8")
+    msg = MIMEMultipart()
     msg["From"] = from_addr
     msg["To"] = to_header
     msg["Subject"] = subject
+    msg.attach(MIMEText(body, "plain", "utf-8"))
 
     try:
         server = smtplib.SMTP(CONFIG["SMTP_SERVER"], int(CONFIG.get("SMTP_PORT", 587)))
@@ -271,68 +316,98 @@ def send_email(subject, body, from_key='MAIL_FROM_DE', to_key='MAIL_TO_DE'):
         print(f"❌ Mail-Fehler bei {to_key}: {e}")
 
 # ========== 7. MongoDB Synchronisation ==========
-def sync_mongodb_station(station_id: str, row_data: dict, messdatum_str: str):
-    if collection_pollen is None:
-        return
+def baue_pollen_dokument(station_id: str, row_data: dict):
+    """Bestehende pollen_live-Felder bleiben kompatibel mit dem Gemeinde-Widget."""
+    messtag = parse_messzeit(row_data)
+    if messtag is None or not hat_messwerte(row_data):
+        raise ValueError("Kein gültiger Messzeitstempel oder keine gültigen Pollenwerte")
 
     pollen_values = {}
-    highest_level = "schwach"
-
+    highest_level = None
+    rang = {"schwach": 1, "maessig": 2, "stark": 3, "sehr stark": 4}
     for param, rules in THRESHOLDS.items():
-        val_str = row_data.get(param, "")
-        try:
-            val_float = float(val_str) if val_str else 0.0
-        except ValueError:
-            val_float = 0.0
-
+        val_float = parse_pollenwert(row_data.get(param))
         p_info = DICT["pollen"].get(param, {})
-        level = "schwach"
-        if val_float >= rules["sehr_stark"]:
-            level = "sehr stark"
-            highest_level = "sehr stark"
-        elif val_float >= rules["stark"]:
-            level = "stark"
-            if highest_level != "sehr stark":
-                highest_level = "stark"
-        elif val_float >= int(rules["maessig"].split("-")[0]):
-            level = "maessig"
-            if highest_level == "schwach":
-                highest_level = "maessig"
-
+        level = None
+        if val_float is not None:
+            if val_float >= rules["sehr_stark"]:
+                level = "sehr stark"
+            elif val_float >= rules["stark"]:
+                level = "stark"
+            elif val_float >= int(rules["maessig"].split("-")[0]):
+                level = "maessig"
+            else:
+                level = "schwach"
+            if highest_level is None or rang[level] > rang[highest_level]:
+                highest_level = level
         pollen_values[param] = {
-            "name_de": p_info.get("de"),
-            "name_fr": p_info.get("fr"),
-            "value": val_float,
-            "level": level
+            "name_de": p_info.get("de"), "name_fr": p_info.get("fr"),
+            "value": val_float, "level": level
         }
 
-    doc = {
+    return {
         "station_id": station_id,
         "name_de": DICT["stations"][station_id]["de"],
         "name_fr": DICT["stations"][station_id]["fr"],
-        "messdatum": messdatum_str,
+        "messdatum": messtag.strftime("%d.%m.%Y"),
+        "messdatum_iso": messtag.date().isoformat(),
+        "messzeit_utc": messtag,
         "highest_level": highest_level,
         "values": pollen_values,
-        "last_updated": datetime.utcnow()
+        "datenqualitaet": {
+            "gueltige_pollenarten": sum(v["value"] is not None for v in pollen_values.values()),
+            "fehlende_pollenarten": [p for p, v in pollen_values.items() if v["value"] is None]
+        },
+        "quelle": "MeteoSchweiz OGD Pollen, Tagesmittel d_recent"
     }
 
+
+def sync_mongodb_station(station_id: str, row_data: dict, messdatum_str: str):
+    """Speichert aktuellen Tageswert und Verlauf; ändert keine Meldungslogik.
+
+    Ist ein Datum bereits vorhanden und unverändert, erfolgen keine Schreibzugriffe.
+    Ein alter Datensatz darf einen neueren Live-Datensatz nicht überschreiben.
+    """
+    if collection_pollen is None or collection_pollen_verlauf is None:
+        raise RuntimeError("MongoDB pollen_live/pollen_verlauf nicht konfiguriert")
+    doc = baue_pollen_dokument(station_id, row_data)
+    messtag_iso = doc["messdatum_iso"]
+    now = datetime.now(timezone.utc)
+    history_id = f"{station_id}:{messtag_iso}"
+    existing_history = collection_pollen_verlauf.find_one({"_id": history_id})
+    felder = ("messdatum_iso", "values", "highest_level", "datenqualitaet")
+    if not existing_history or any(existing_history.get(k) != doc.get(k) for k in felder):
+        collection_pollen_verlauf.update_one(
+            {"_id": history_id},
+            {"$set": {**doc, "last_updated": now}, "$setOnInsert": {"created_at": now}},
+            upsert=True
+        )
+
+    existing = collection_pollen.find_one({"station_id": station_id})
+    previous_iso = (existing or {}).get("messdatum_iso")
+    if previous_iso and previous_iso > messtag_iso:
+        return "aelter_als_live"
+    if existing and all(existing.get(k) == doc.get(k) for k in felder):
+        return "unveraendert"
     collection_pollen.update_one(
         {"station_id": station_id},
-        {"$set": doc},
+        {"$set": {**doc, "last_updated": now}},
         upsert=True
     )
+    return "aktualisiert"
 
 # ========== 8. Hauptlauf ==========
-def process_pollen():
+def process_pollen(dry_run=False, nur_daten=False):
     seen = _load_json(SEEN_FILE, {})
     today_str = datetime.now().strftime("%d.%m.%Y")
     seen_date_str = datetime.now().strftime("%Y-%m-%d")
     weekday_idx = datetime.now().weekday()
 
-    bg_texts = {
+    # Im Test- oder reinen Datenbetrieb keine zusätzlichen Webseiten abrufen.
+    bg_texts = ({"de": "", "fr": ""} if dry_run or nur_daten else {
         "de": fetch_current_background_text("de"),
         "fr": fetch_current_background_text("fr")
-    }
+    })
 
     print(f"🔄 Starte Abfrage der Pollendaten für alle Stationen ({today_str})...")
     updated_stations = 0
@@ -346,19 +421,36 @@ def process_pollen():
             print("   ⚠️ Keine CSV-Daten verfügbar (MeteoSchweiz liefert für diese Station aktuell keine Daten).")
             continue
 
-        messdatum_str = today_str
-        for key, val in csv_today.items():
-            if key and any(k in key.lower() for k in ["date", "datum", "time"]):
-                try:
-                    messdatum_str = datetime.strptime(val[:10], "%Y-%m-%d").strftime("%d.%m.%Y")
-                except ValueError:
-                    pass
-                break
+        messzeit = parse_messzeit(csv_today)
+        if messzeit is None or not hat_messwerte(csv_today):
+            print("   ⚠️ Ungültige Quelldaten: kein MongoDB-Schreibzugriff, kein Alarm.")
+            continue
+        messdatum_str = messzeit.strftime("%d.%m.%Y")
+        vorhanden = sum(parse_pollenwert(csv_today.get(p)) is not None for p in THRESHOLDS)
+        fehlend = len(THRESHOLDS) - vorhanden
 
-        # 1. MongoDB LIVE-HUB IMMER AKTUALISIEREN
-        sync_mongodb_station(station_id, csv_today, messdatum_str)
+        if dry_run:
+            print(f"   🧪 TROCKENLAUF: Messdatum {messdatum_str}; gültige Werte {vorhanden}/7, fehlend {fehlend}. Keine Speicherung, keine Mails.")
+            updated_stations += 1
+            continue
+
+        # 1. MongoDB LIVE-HUB UND TAGESVERLAUF IMMER SYNCHRONISIEREN
+        status = sync_mongodb_station(station_id, csv_today, messdatum_str)
         updated_stations += 1
-        print(f"   💾 In MongoDB ('pollen_live') aktualisiert (Messdatum: {messdatum_str}).")
+        print(f"   💾 MongoDB pollen_live / pollen_verlauf: {status} (Messdatum: {messdatum_str}; gültige Werte {vorhanden}/7).")
+
+        if nur_daten:
+            print("   ℹ️ Nur-Daten-Modus: Keine Alarmprüfung, keine Mails.")
+            continue
+        if status == "aelter_als_live":
+            print("   ℹ️ Quellmessung älter als aktueller MongoDB-Stand: kein Alarm.")
+            continue
+        if datetime.now(timezone.utc) - messzeit > timedelta(days=3):
+            print("   ℹ️ Messdaten älter als drei Tage: kein Agenturalarm.")
+            continue
+        if seen.get(f"{station_id}_checked_messdatum") == messdatum_str:
+            print("   ℹ️ Dieser Messtag wurde bereits redaktionell geprüft.")
+            continue
 
         # 2. ALARM-PRÜFUNG (Wird nur 1x täglich pro Station ausgelöst)
         if seen.get(f"{station_id}_run_date") == seen_date_str:
@@ -377,11 +469,11 @@ def process_pollen():
                 val_float = float(val_str)
                 if val_float >= rules["stark"]:
                     p_info = DICT["pollen"][param]
-                    raw_prev = csv_last.get(param, "0")
-                    try:
-                        prev_float = float(raw_prev) if str(raw_prev).strip() != "" else 0.0
-                    except ValueError:
-                        prev_float = 0.0
+                    prev_val = parse_pollenwert(csv_last.get(param))
+                    # Ohne belastbaren Vortagswert keine prozentuale Trendbehauptung.
+                    if prev_val is None:
+                        continue
+                    prev_float = prev_val
 
                     if val_float > prev_float * 1.1:
                         trend_key = "gestiegen"
@@ -427,8 +519,7 @@ def process_pollen():
 
         if has_trigger:
             print(f"🚨 Auslöser erkannt für Station {station_id.upper()}! Generiere Textmeldungen...")
-            for lang, to_key, from_key in [("de", "MAIL_TO_DE", "MAIL_FROM_DE"),
-                                           ("fr", "MAIL_TO_FR", "MAIL_FROM_FR")]:
+            for lang, to_key in [("de", "MAIL_TO_DE"), ("fr", "MAIL_TO_FR")]:
                 if not alerts[lang]["trigger"]:
                     continue
 
@@ -445,17 +536,13 @@ def process_pollen():
                     subj = f"Alerte Pollens: {reg_name} ({today_str})"
 
                 if lang == "de":
-                    notes = "\n\n---\nQUELLEN ZUR VERIFIKATION:\n" + "\n".join(alerts["de"][
-                                                                                   "links"]) + f"\n\nHintergrund: {DICT['aha_urls']['de']}\n\nSchwellenwerte:\n" + "\n".join(
-                        alerts["de"]["desk"])
+                    notes = "\n\n---\nQUELLEN ZUR VERIFIKATION:\n" + "\n".join(alerts["de"]["links"]) + f"\n\nHintergrund: {DICT['aha_urls']['de']}\n\nSchwellenwerte:\n" + "\n".join(alerts["de"]["desk"])
                     body = f"{article}\n\n---\nTrigger:\n" + "\n".join(alerts["de"]["trigger"]) + notes
                 else:
-                    notes = "\n\n---\nSOURCES POUR VÉRIFICATION:\n" + "\n".join(
-                        alerts["fr"]["links"]) + f"\n\nContexte: {DICT['aha_urls']['fr']}\n\nSeuils:\n" + "\n".join(
-                        alerts["fr"]["desk"])
+                    notes = "\n\n---\nSOURCES POUR VÉRIFICATION:\n" + "\n".join(alerts["fr"]["links"]) + f"\n\nContexte: {DICT['aha_urls']['fr']}\n\nSeuils:\n" + "\n".join(alerts["fr"]["desk"])
                     body = f"{article}\n\n---\nDéclencheurs:\n" + "\n".join(alerts["fr"]["trigger"]) + notes
 
-                send_email(subj, body, from_key=from_key, to_key=to_key)
+                send_email(subj, body, to_key)
 
             for p, r in THRESHOLDS.items():
                 v = csv_today.get(p, "")
@@ -472,10 +559,18 @@ def process_pollen():
                     pass
 
         seen[f"{station_id}_run_date"] = seen_date_str
+        seen[f"{station_id}_checked_messdatum"] = messdatum_str
         _save_json(SEEN_FILE, seen)
 
-    print(f"💾 Gesamt: {updated_stations} Stationen in MongoDB ('pollen_live') aktualisiert.")
+    print(f"💾 Gesamt: {updated_stations} Stationen verarbeitet (pollen_live + pollen_verlauf; Testläufe schreiben nicht).")
     print("🏁 Pollen-Durchlauf vollständig abgeschlossen.")
 
 if __name__ == "__main__":
-    process_pollen()
+    parser = argparse.ArgumentParser(description="Einziger MeteoSchweiz-Pollenbot: MongoDB und Agenturmeldungen")
+    modus = parser.add_mutually_exclusive_group()
+    modus.add_argument("--dry-run", action="store_true",
+                       help="Pollendaten abrufen und prüfen, ohne MongoDB-Schreibzugriffe oder E-Mails")
+    modus.add_argument("--nur-daten", action="store_true",
+                       help="MongoDB aktualisieren, aber keine KI-Generierung und keine E-Mails")
+    args = parser.parse_args()
+    process_pollen(dry_run=args.dry_run, nur_daten=args.nur_daten)
